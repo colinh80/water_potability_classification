@@ -1,0 +1,295 @@
+---
+title: "Water Potability Prediction"
+author: "Colin Hicks"
+date: "8/25/2021"
+output: html_document
+---
+
+# Summary
+
+Implementation of predictive models to determine if the sample tested from a body of water is fit for human consumption. This project includes exploratory analysis, data cleaning, preprocessing, and execution of KNN and Random Forest models for comparison.
+
+###### [Data Source](https://www.kaggle.com/adityakadiwal/water-potability)
+
+
+## View Data
+
+```{r include=FALSE}
+library(tidyverse)
+library(lubridate)
+library(reshape2)
+library(e1071)
+library(class)
+library(caret)
+
+```
+
+
+```{r results='hide'}
+wq_df <- read.csv("/Users/colinhicks/Documents/data_science/data_sets/water_quality/water_potability.csv")
+```
+
+
+```{r echo=FALSE}
+head(wq_df)
+wq_df %>% summary()
+```
+
+```{r include=FALSE}
+wq_df <- wq_df %>%  na.omit()
+
+# convert potability feature to logical
+
+wq_df <- wq_df %>% mutate(Potability=as.logical(Potability))
+```
+
+
+## Observe label counts
+
+```{r echo=FALSE}
+# potability counts
+
+potability_count <- wq_df %>% group_by(Potability) %>% summarise(count = n())
+potability_count <- data.frame(potability_count)
+potability_count
+potability_bar_graph <- potability_count %>% ggplot(aes(Potability, count)) +
+  geom_bar(stat="identity") +
+  labs(title = "Potability Count")
+potability_bar_graph
+```
+
+## Feature Boxplots
+
+```{r echo=FALSE, fig.show="hold", out.width="33%" }
+# box plots for each feature
+
+col_names <- names(wq_df)[1:9]
+Y <- wq_df$Potability %>% as.factor
+boxplot.function <- function() {
+  for(i in col_names) {
+   plot <- ggplot(wq_df, aes_string(Y,i, group=Y)) +
+     geom_boxplot() +
+     labs(x = "Potability")
+   print(plot)
+  }
+}
+
+boxplot.function()
+```
+
+
+## Correlation Matrix
+
+```{r include=FALSE}
+# correlation plot
+
+  # melted correlations heat map
+corr <- round(cor(wq_df),4)
+melted_corr <- melt(corr)
+
+ggplot(data = melted_corr, aes(x=Var1, y=Var2, fill=value)) + 
+  geom_tile() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  coord_fixed()
+
+  # upper triangle of correlation matrix
+
+upper_tri <- function(corr){
+  corr[lower.tri(corr)]<- NA
+  return(corr)
+}
+
+upper_tri <- upper_tri(corr)
+
+  # upper matrix melted
+
+melted_upper_corr <- melt(upper_tri, na.rm = TRUE)
+
+  # cleaned correlation heat map with values
+
+corr_heatmap <- ggplot(data = melted_upper_corr, aes(Var2, Var1, fill = value)) +
+  geom_tile(color = "grey") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                       midpoint = 0, limit = c(-1,1), space = "Lab",
+                       name="Pearson\nCorrelation") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  coord_fixed()
+
+corr_heatmapv2 <- corr_heatmap + 
+  geom_text(aes(Var2, Var1, label = value), color = "black", size = 2) +
+  theme( axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.border = element_blank(),
+    panel.background = element_blank(),
+    axis.ticks = element_blank(),
+    legend.justification = c(1, 0),
+    legend.position = c(0.6, 0.7),
+    legend.direction = "horizontal") +
+  guides(fill = guide_colorbar(barwidth = 7, barheight = 1,
+                               title.position = "top", title.hjust = 0.5))
+
+```
+
+
+```{r echo=FALSE}
+corr_heatmapv2
+```
+
+## Distribution plots for each feature
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# distribution plots for each feature
+
+wq_df %>% keep(is.numeric) %>%
+  gather() %>%
+  ggplot(aes(value)) +
+  facet_wrap(~ key, scales ="free") +
+  geom_histogram(aes(y=..density..),
+                 colour="black", fill="white") +
+  geom_density(alpha=.2, fill="red")
+```
+
+## Remove Outliers
+
+Using the interquartile range I removed 222 rows total from the data set to adjust
+the variable skew.
+
+```{r}
+outliers <- function(x) {
+  
+  q1 <- quantile(x, probs=.25)
+  q3 <- quantile(x, probs=.75)
+  iqr = q3-q1
+  upper_limit = q3 + (iqr*1.5)
+  lower_limit = q1 - (iqr*1.5)
+  x > upper_limit | x < lower_limit
+}
+
+remove_outliers <- function(df, cols = names(df)) {
+  for (col in cols) {
+    df <- df[!outliers(df[[col]]),]
+  }
+  df
+}
+
+# counting removed outliers
+
+nrow(wq_df) - nrow(remove_outliers(wq_df, col_names)) # 222 rows will be removed
+
+# create new dataframe without outliers
+
+wq_df_v2 <- remove_outliers(wq_df, col_names)
+```
+
+## Skew Adjustments
+
+After the skew adjustments, we can see a large improvement within Hardness and Solids. However, features such as Chloramines and Turbidity saw worse skew after the adjustment. Perhaps
+it would be better to ignore features that already have skew under .1. Then apply a log transformation to Conductivity and Solids, since they are both positively skewed with a skewness over .2.
+
+```{r echo=FALSE}
+# compare skew adjustments
+skew_old <- as.data.frame(lapply(wq_df[1:9], skewness))
+skew_new <- as.data.frame(lapply(wq_df_v2[1:9], skewness))
+skew_compare <- bind_rows(before = gather(skew_old), after = gather(skew_new), .id = "skew")
+
+ggplot(skew_compare, aes(x = key, y = value, fill= skew)) +
+  geom_bar(stat='identity',position=position_dodge(),
+           colour="black" ) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  scale_fill_manual(values=c("red", "grey")) +
+  labs(fill = "Skew Adjustment", x = "Features", y = "Skew Amount")
+
+```
+
+## Distribution Plots after Skew Adjustments
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# distribution plots for each feature after skew adjustment
+
+wq_df_v2 %>% keep(is.numeric) %>%
+  gather() %>%
+  ggplot(aes(value)) +
+  facet_wrap(~ key, scales ="free") +
+  geom_histogram(aes(y=..density..),
+                 colour="black", fill="white") +
+  geom_density(alpha=.2, fill="red")
+```
+
+## Partitioning and Normalizing the Data
+
+```{r results='hide'}
+
+# convert potability label to factor for predictions
+
+wq_df_v2 <- wq_df_v2 %>% mutate(Potability = as.factor(Potability))
+
+# create training and test sets
+
+set.seed(355)
+train_index <- createDataPartition(wq_df_v2$Potability, p = .7, list = FALSE)
+train_set <- wq_df_v2[train_index,]
+test_set <- wq_df_v2[-train_index,]
+
+# normalize train and test set
+ 
+data_norm <- function(x) {
+  ((x - min(x))/(max(x)-min(x)))
+}
+
+train_set_norm <- as.data.frame(lapply(train_set[1:9], data_norm))
+test_set_norm <- as.data.frame(lapply(test_set[1:9], data_norm))
+
+# bind normalized training set with potability label
+
+train_set_norm <- cbind(Potability = train_set$Potability ,train_set_norm)
+```
+
+## Random Forest Prediction and Confusion Matrix
+
+The model ran 25 bootstrap samples as the resampling method. In addition, the model chose Mtry=9, meaning the model used 9 nodes while splitting a tree. Accuracy is 67% with sensitivity at 38% and specificity at 87%.
+
+
+```{r echo=FALSE}
+# random forest prediction
+set.seed(355)
+rf <- train(Potability ~ ., data = train_set_norm, method = "rf" )
+rf
+  # predict test set using random forest
+
+rf_fit <- predict(rf, test_set_norm)
+confusionMatrix(reference = test_set$Potability, data = rf_fit, mode = "everything", 
+                positive = "TRUE")
+```
+
+## KNN Prediction and Confusion Matrix
+
+This model also ran 25 bootstrap samples as the resampling method. In addition, the model chose k=9, meaning each point is predicted based on the 9 closest points in terms of euclidean distance. Accuracy is slightly worse at 64% with sensitivity at 35% and specificity at 83%.
+```{r echo=FALSE}
+# knn prediction
+set.seed(355)
+knn <- train(Potability ~ ., data = train_set_norm, method = "knn" )
+knn
+
+# predict test set using random forest
+
+knn_fit <- predict(knn, test_set_norm)
+confusionMatrix(reference = test_set$Potability, data = knn_fit, mode = "everything", 
+                positive = "TRUE")
+
+```
+
+## Variable Importance for each model
+
+```{r echo=FALSE, fig.show="hold", out.width="50%"}
+varimp_rf <- varImp(rf)
+plot(varimp_rf, main = "Random Forest Variable Importance")
+
+varimp_knn <- varImp(knn)
+plot(varimp_knn, main = "KNN Variable Importance")
+```
+
+## Conclusion
+
+As seen with the correlation matrix reflecting low correlation values amongst variables, this is a tough classification problem. However there are a number of ways to improve this model. Moving forward, considering we are predicting whether or not water is clean to drink, I'd certainly want to optimize for specificity. That would be my targeted metric as I continue constructing a better model with this data set. That being said, there are a couple improvements I would focus on next to increase both accuracy and specificity. The first regarding skew transformations, which I mentioned earlier. Another idea would be to drop variables such as Organic Carbon and Trihalomethane to reduce noise, because both those features were unimportant under the KNN and Random Forest models.
